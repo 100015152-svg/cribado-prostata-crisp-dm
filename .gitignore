@@ -1,0 +1,6 @@
+.vs/
+session-state/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
