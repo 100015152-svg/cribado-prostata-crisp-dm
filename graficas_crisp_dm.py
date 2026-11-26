@@ -4,8 +4,9 @@ Prototipo de simulación y evaluación de umbral para cribado de cáncer de pró
 
 Nota metodológica:
 - Es una simulación sintética para validar el pipeline (splines, boosting ponderado,
-  calibración Platt/isotónica y selección de umbral por límite superior del IC 95% de FN < 1%),
-  no la serie histórica real (2006-2021) ni un sistema listo para producción.
+  calibración Platt/isotónica y selección de umbral con límite superior exacto
+  Clopper-Pearson del IC 95% de la FNR < 1%), no la serie histórica real
+  (2006-2021) ni un sistema listo para producción.
 """
 
 from pathlib import Path
@@ -13,6 +14,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.stats import beta
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
@@ -99,18 +101,21 @@ def evaluar_umbral(
     y_true: np.ndarray,
     probs: np.ndarray,
     tau: float,
-    rng: np.random.Generator,
-    n_boot: int = 500,
 ) -> dict[str, float]:
   pred_pos = (probs >= tau).astype(int)
-  fn_mask = ((y_true == 1) & (pred_pos == 0)).astype(float)
-  fn_pct = fn_mask.mean() * 100.0
+  positivos = y_true == 1
+  n_positivos = int(positivos.sum())
+  if n_positivos == 0:
+    raise ValueError("No se puede estimar la FNR sin casos positivos reales.")
 
-  boot_fn = [
-      fn_mask[rng.integers(0, len(fn_mask), size=len(fn_mask))].mean() * 100.0
-      for _ in range(n_boot)
-  ]
-  ci95_sup = float(np.percentile(boot_fn, 97.5))
+  n_fn = int((positivos & (pred_pos == 0)).sum())
+  fn_pct = n_fn / n_positivos * 100.0
+  # Upper endpoint of the two-sided exact 95% Clopper-Pearson interval.
+  ci95_sup = (
+      100.0
+      if n_fn == n_positivos
+      else float(beta.ppf(0.975, n_fn + 1, n_positivos - n_fn) * 100.0)
+  )
   fp_pct = float(((y_true == 0) & (pred_pos == 1)).mean() * 100.0)
   deriv_pct = float(pred_pos.mean() * 100.0)
 
@@ -214,11 +219,16 @@ def generar_graficas(
   axes[1, 0].legend(fontsize=8)
   axes[1, 0].grid(alpha=0.25)
 
-  axes[1, 1].plot(df_umb["umbral"], df_umb["fn_pct"], label="% FN (val)", lw=2.0)
+  axes[1, 1].plot(
+      df_umb["umbral"],
+      df_umb["fn_pct"],
+      label="FNR: FN entre positivos (val)",
+      lw=2.0,
+  )
   axes[1, 1].plot(
       df_umb["umbral"],
       df_umb["ci95_sup_pct"],
-      label="Límite sup. IC 95% FN (val)",
+      label="Límite sup. exacto Clopper-Pearson 95% (val)",
       ls="--",
       lw=2.0,
   )
@@ -238,7 +248,7 @@ def generar_graficas(
     )
   axes[1, 1].set_title("4. Selección de umbral seguro (en VAL)")
   axes[1, 1].set_xlabel("Umbral de probabilidad (τ)")
-  axes[1, 1].set_ylabel("Porcentaje sobre cohorte val (%)")
+  axes[1, 1].set_ylabel("Porcentaje (%; FNR sobre positivos, FP/derivaciones sobre cohorte)")
   axes[1, 1].legend(fontsize=7.5, loc="upper right")
   axes[1, 1].grid(alpha=0.25)
 
@@ -250,7 +260,6 @@ def generar_graficas(
 def main() -> None:
   n = 5000
   seed = 42
-  rng = np.random.default_rng(seed)
   output_dir = Path("outputs")
   output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -350,9 +359,16 @@ def main() -> None:
         f"| Brier: {brier_score_loss(y_test, p):.4f}"
     )
 
+  n_positivos_val = int(y_val.sum())
+  minimo_ci95_val = float(beta.ppf(0.975, 1, n_positivos_val) * 100.0)
+  print(
+      f"\nCasos positivos en VAL: {n_positivos_val} | "
+      f"Límite sup. exacto 95% incluso con 0 FN: {minimo_ci95_val:.2f}%"
+  )
+
   umbrales = np.linspace(0.005, 0.15, 80)
   filas_val = [
-      evaluar_umbral(y_val.values, preds_val["HGB calibrado Platt"], tau, rng)
+      evaluar_umbral(y_val.values, preds_val["HGB calibrado Platt"], tau)
       for tau in umbrales
   ]
   df_umb = pd.DataFrame(filas_val)
@@ -360,19 +376,23 @@ def main() -> None:
   validos = df_umb[df_umb["ci95_sup_pct"] < 1.0]
   umbral_elegido = float(validos["umbral"].max()) if not validos.empty else None
 
-  base_pos_test = (test["psa_total"].values >= 3.0).astype(int)
-  base_fp = float(((y_test.values == 0) & (base_pos_test == 1)).mean() * 100.0)
-  base_fn = float(((y_test.values == 1) & (base_pos_test == 0)).mean() * 100.0)
-  base_deriv = float(base_pos_test.mean() * 100.0)
+  res_base_test = evaluar_umbral(
+      y_test.values, test["psa_total"].values, 3.0
+  )
+  base_fp = res_base_test["fp_pct"]
+  base_fn = res_base_test["fn_pct"]
+  base_fn_ci95 = res_base_test["ci95_sup_pct"]
+  base_deriv = res_base_test["deriv_pct"]
 
   print(
       f"\nProtocolo base en TEST (PSA >= 3.0) -> Derivaciones: {base_deriv:.2f}% | "
-      f"FP: {base_fp:.2f}% | FN: {base_fn:.2f}%"
+      f"FP: {base_fp:.2f}% | FNR: {base_fn:.2f}% "
+      f"(IC exacto 95% Clopper-Pearson sup.: {base_fn_ci95:.2f}%)"
   )
 
   if umbral_elegido is not None:
     res_test = evaluar_umbral(
-        y_test.values, preds_test["HGB calibrado Platt"], umbral_elegido, rng
+        y_test.values, preds_test["HGB calibrado Platt"], umbral_elegido
     )
     red_fp = ((base_fp - res_test["fp_pct"]) / max(base_fp, 1e-9)) * 100.0
     red_deriv = (
@@ -381,8 +401,8 @@ def main() -> None:
     print(f"Umbral elegido (seleccionado en VAL): {umbral_elegido:.4f}")
     print(
         f"En TEST con umbral elegido -> Derivaciones: {res_test['deriv_pct']:.2f}% | "
-        f"FP: {res_test['fp_pct']:.2f}% | FN: {res_test['fn_pct']:.2f}% "
-        f"(IC 95% sup: {res_test['ci95_sup_pct']:.2f}%)"
+        f"FP: {res_test['fp_pct']:.2f}% | FNR: {res_test['fn_pct']:.2f}% "
+        f"(IC exacto 95% Clopper-Pearson sup.: {res_test['ci95_sup_pct']:.2f}%)"
     )
     print(
         f"Reducción relativa en TEST vs. protocolo base -> Derivaciones: {red_deriv:.1f}% | "
@@ -390,7 +410,8 @@ def main() -> None:
     )
   else:
     print(
-        "Ningún umbral en el rango evaluado cumple IC 95% superior de FN < 1% en VAL."
+        "Ningún umbral en el rango evaluado cumple límite superior exacto "
+        "Clopper-Pearson 95% de FNR < 1% en VAL."
     )
 
   fig_path = output_dir / "todas_las_graficas_prostata.png"
